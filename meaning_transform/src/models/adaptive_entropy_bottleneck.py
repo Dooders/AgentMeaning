@@ -18,6 +18,7 @@ class AdaptiveEntropyBottleneck(CompressionBase):
         self,
         latent_dim: int,
         compression_level: float = 1.0,
+        threshold: float = 1.2,
         seed: Optional[int] = None,
     ):
         """
@@ -26,6 +27,7 @@ class AdaptiveEntropyBottleneck(CompressionBase):
         Args:
             latent_dim: Dimension of latent space
             compression_level: Level of compression (higher = more compression)
+            threshold: Compression level threshold for using projection layers
             seed: Random seed for reproducibility
         """
         super().__init__(latent_dim, compression_level)
@@ -37,26 +39,34 @@ class AdaptiveEntropyBottleneck(CompressionBase):
             raise ValueError(f"compression_level must be positive, got {compression_level}")
             
         self.seed = seed
+        self.use_projection = compression_level >= threshold
         
         # Register buffer to track compressed values
         self.register_buffer("_compression_epsilon", torch.tensor(1e-6))
 
         # Initialize parameters using temp seed (if provided)
         with set_temp_seed(seed):
-            # Learnable parameters sized to effective dimension
-            self.compress_mu = nn.Parameter(torch.zeros(self.effective_dim))
-            self.compress_log_scale = nn.Parameter(torch.zeros(self.effective_dim))
+            if self.use_projection:
+                # Learnable parameters sized to effective dimension
+                self.compress_mu = nn.Parameter(torch.zeros(self.effective_dim))
+                self.compress_log_scale = nn.Parameter(torch.zeros(self.effective_dim))
 
-            # Projection layers with adaptive dimensions
-            self.proj_down = nn.Linear(latent_dim, self.effective_dim)
-            self.nonlin = nn.LeakyReLU()
-            self.proj_up = nn.Linear(
-                self.effective_dim, latent_dim * 2
-            )  # mu and log_scale for reconstruction
+                # Projection layers with adaptive dimensions
+                self.proj_down = nn.Linear(latent_dim, self.effective_dim)
+                self.nonlin = nn.LeakyReLU()
+                self.proj_up = nn.Sequential(
+                    nn.Linear(self.effective_dim, latent_dim // 4),
+                    nn.LeakyReLU(),
+                    nn.Linear(latent_dim // 4, latent_dim * 2)
+                )
+            else:
+                # Use simpler parameterization for near-identity cases
+                self.compress_params = nn.Parameter(torch.zeros(latent_dim, 2))
 
         logging.info(
             f"Created AdaptiveEntropyBottleneck with latent_dim={latent_dim}, "
-            f"compression_level={compression_level}, effective_dim={self.effective_dim}"
+            f"compression_level={compression_level}, effective_dim={self.effective_dim}, "
+            f"use_projection={self.use_projection}"
         )
 
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -90,36 +100,48 @@ class AdaptiveEntropyBottleneck(CompressionBase):
             if mean_abs_fractional < self._compression_epsilon:
                 return z, torch.zeros(1, device=z.device)
 
-        # Project down to effective dimension
-        z_down = self.proj_down(z)
-        z_down = self.nonlin(z_down)
+        if self.use_projection:
+            # Project down to effective dimension
+            z_down = self.proj_down(z)
+            z_down = self.nonlin(z_down)
 
-        # Apply compression in the effective space
-        mu = z_down + self.compress_mu
-        log_scale = self.compress_log_scale.clone()
+            # Apply compression in the effective space
+            mu = z_down + self.compress_mu
+            log_scale = self.compress_log_scale.clone()
 
-        # Add noise for quantization in the effective space
-        if self.training:
-            # Reparameterization trick during training
-            with set_temp_seed(self.seed):
-                epsilon = torch.randn_like(mu)
-            z_compressed_effective = mu + torch.exp(log_scale) * epsilon
+            # Add noise for quantization in the effective space
+            if self.training:
+                # Reparameterization trick during training
+                with set_temp_seed(self.seed):
+                    epsilon = torch.randn_like(mu)
+                z_compressed_effective = mu + torch.exp(log_scale) * epsilon
+            else:
+                # Deterministic rounding during inference
+                z_compressed_effective = torch.round(mu)
+
+            # Project back up to full latent space
+            projected = self.proj_up(z_compressed_effective)
+            mu_full, log_scale_full = torch.chunk(projected, 2, dim=-1)
+            
+            # Use mu_full directly as the compressed representation
+            z_compressed = mu_full
+
+            # Compute entropy loss (bits per dimension) with improved numerical stability
+            compression_loss = 0.5 * log_scale.mul(2).exp() + 0.5 * torch.log(
+                2 * torch.tensor(np.pi, device=z.device)
+            )
+            compression_loss = compression_loss.mean()
         else:
-            # Deterministic rounding during inference
-            z_compressed_effective = torch.round(mu)
+            # Simplified path for low compression
+            params = self.compress_params
+            mu, log_scale = params[:, 0], params[:, 1]
+            z_compressed = mu
 
-        # Project back up to full latent space
-        projected = self.proj_up(z_compressed_effective)
-        mu_full, log_scale_full = torch.chunk(projected, 2, dim=-1)
-        
-        # Use mu_full directly as the compressed representation
-        z_compressed = mu_full
-
-        # Compute entropy loss (bits per dimension) with improved numerical stability
-        compression_loss = 0.5 * log_scale.mul(2).exp() + 0.5 * torch.log(
-            2 * torch.tensor(np.pi, device=z.device)
-        )
-        compression_loss = compression_loss.mean()
+            # Compute entropy loss (bits per dimension) with improved numerical stability
+            compression_loss = 0.5 * log_scale.exp().pow(2) + 0.5 * torch.log(
+                2 * torch.tensor(np.pi, device=z.device)
+            )
+            compression_loss = compression_loss.mean()
 
         return z_compressed, compression_loss
 

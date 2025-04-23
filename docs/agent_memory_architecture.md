@@ -134,3 +134,85 @@ While maintaining independent memory systems, some cross-agent mechanisms may be
    - Aggregate learning about optimal compression across agents
    - Update compression strategies based on fleet-wide performance
    - Maintain individuality while benefiting from collective experience
+
+## Optimized Memory Efficiency
+
+### Conditional Computation Architecture
+
+The `AdaptiveEntropyBottleneck` now implements a conditional computation architecture, creating projection layers only if compression exceeds a threshold. This reduces unnecessary parameter overhead and improves memory efficiency.
+
+```python
+class AdaptiveEntropyBottleneck(nn.Module):
+    def __init__(self, latent_dim, compression_level=1.0, threshold=1.2):
+        super().__init__()
+        self.use_projection = compression_level >= threshold
+        
+        if self.use_projection:
+            self.proj_down = nn.Linear(latent_dim, self.effective_dim)
+            self.proj_up = nn.Linear(self.effective_dim, latent_dim * 2)
+        else:
+            self.compress_params = nn.Parameter(torch.zeros(latent_dim, 2))
+    
+    def forward(self, z):
+        if self.use_projection:
+            z_down = self.proj_down(z)
+            # ... rest of current implementation
+        else:
+            params = self.compress_params
+            mu, log_scale = params[:, 0], params[:, 1]
+            # ... simplified compression logic
+```
+
+### Parameter Sharing in FeatureGroupedVAE
+
+The `FeatureGroupedVAE` now shares components across feature groups, reducing parameter count and improving memory efficiency.
+
+```python
+class FeatureGroupedVAE(nn.Module):
+    def __init__(self, input_dim, latent_dim, feature_groups):
+        super().__init__()
+        self.shared_compressor = nn.Module()
+        self.shared_compressor.mu_network = nn.Linear(latent_dim, latent_dim)
+        self.shared_compressor.scale_network = nn.Linear(latent_dim, latent_dim)
+        
+        self.group_params = nn.ParameterDict()
+        for name in feature_groups:
+            self.group_params[name] = nn.Parameter(torch.zeros(group_latent_dim, 2))
+```
+
+### Low-Rank Approximations for Large Projections
+
+For larger projection matrices, low-rank approximations are used to reduce parameter count and improve memory efficiency.
+
+```python
+class AdaptiveEntropyBottleneck(nn.Module):
+    def __init__(self, latent_dim, compression_level=1.0, threshold=1.2):
+        super().__init__()
+        self.use_projection = compression_level >= threshold
+        
+        if self.use_projection:
+            self.proj_down = nn.Linear(latent_dim, self.effective_dim)
+            self.proj_up = nn.Sequential(
+                nn.Linear(self.effective_dim, latent_dim // 4),
+                nn.LeakyReLU(),
+                nn.Linear(latent_dim // 4, latent_dim * 2)
+            )
+        else:
+            self.compress_params = nn.Parameter(torch.zeros(latent_dim, 2))
+    
+    def forward(self, z):
+        if self.use_projection:
+            z_down = self.proj_down(z)
+            # ... rest of current implementation
+        else:
+            params = self.compress_params
+            mu, log_scale = params[:, 0], params[:, 1]
+            # ... simplified compression logic
+```
+
+## Expected Benefits
+
+- **Reduced Memory Usage**: Potentially 50-80% reduction in parameter count for adaptive models
+- **Faster Training**: Fewer parameters = faster gradient updates
+- **More Efficient Inference**: Especially important for deployment scenarios
+- **Better Scaling**: Architecture will adapt more efficiently across compression levels

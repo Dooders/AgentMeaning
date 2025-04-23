@@ -70,8 +70,13 @@ class FeatureGroupedVAE(nn.Module, BaseModelIO):
         self.encoder = Encoder(input_dim, latent_dim, use_batch_norm=use_batch_norm)
         self.decoder = Decoder(latent_dim, input_dim, use_batch_norm=use_batch_norm)
 
+        # Create shared compressor
+        self.shared_compressor = nn.Module()
+        self.shared_compressor.mu_network = nn.Linear(latent_dim, latent_dim)
+        self.shared_compressor.scale_network = nn.Linear(latent_dim, latent_dim)
+
         # Create separate bottlenecks for each feature group
-        self.bottlenecks = nn.ModuleDict()
+        self.group_params = nn.ParameterDict()
         self.group_latent_dims = {}
 
         # Determine latent dimension allocation per group
@@ -165,12 +170,8 @@ class FeatureGroupedVAE(nn.Module, BaseModelIO):
                 latent_start_idx + group_latent_dim,
             )
 
-            # Create bottleneck for this group
-            self.bottlenecks[name] = AdaptiveEntropyBottleneck(
-                latent_dim=group_latent_dim,
-                compression_level=effective_compression,
-                seed=seed,
-            )
+            # Create parameter for this group
+            self.group_params[name] = nn.Parameter(torch.zeros(group_latent_dim, 2))
 
             latent_start_idx += group_latent_dim
 
@@ -224,17 +225,30 @@ class FeatureGroupedVAE(nn.Module, BaseModelIO):
             # Get latent vector segment for this group
             z_group = z[:, start_idx:end_idx]
 
-            # Apply group-specific bottleneck
-            z_group_compressed, group_loss = self.bottlenecks[name](z_group)
+            # Apply shared compressor
+            mu_group = self.shared_compressor.mu_network(z_group)
+            log_scale_group = self.shared_compressor.scale_network(z_group)
+
+            # Add noise for quantization in the effective space
+            if self.training:
+                # Reparameterization trick during training
+                with set_temp_seed(self.seed):
+                    epsilon = torch.randn_like(mu_group)
+                z_group_compressed = mu_group + torch.exp(log_scale_group) * epsilon
+            else:
+                # Deterministic rounding during inference
+                z_group_compressed = torch.round(mu_group)
 
             # Store compressed representation
             z_compressed[:, start_idx:end_idx] = z_group_compressed
 
             # Accumulate compression loss
-            compression_loss += group_loss
+            compression_loss += 0.5 * log_scale_group.mul(2).exp() + 0.5 * torch.log(
+                2 * torch.tensor(torch.pi, device=z.device)
+            )
 
         # Average compression loss across groups
-        compression_loss = compression_loss / len(self.bottlenecks)
+        compression_loss = compression_loss.mean()
 
         # Decode compressed representation
         x_reconstructed = self.decoder(z_compressed)
@@ -273,8 +287,19 @@ class FeatureGroupedVAE(nn.Module, BaseModelIO):
             # Get latent vector segment for this group
             z_group = z[:, start_idx:end_idx]
 
-            # Apply group-specific bottleneck
-            z_group_compressed, _ = self.bottlenecks[name](z_group)
+            # Apply shared compressor
+            mu_group = self.shared_compressor.mu_network(z_group)
+            log_scale_group = self.shared_compressor.scale_network(z_group)
+
+            # Add noise for quantization in the effective space
+            if self.training:
+                # Reparameterization trick during training
+                with set_temp_seed(self.seed):
+                    epsilon = torch.randn_like(mu_group)
+                z_group_compressed = mu_group + torch.exp(log_scale_group) * epsilon
+            else:
+                # Deterministic rounding during inference
+                z_group_compressed = torch.round(mu_group)
 
             # Store compressed representation
             z_compressed[:, start_idx:end_idx] = z_group_compressed
@@ -303,10 +328,9 @@ class FeatureGroupedVAE(nn.Module, BaseModelIO):
         """Get the effective compression rate for each feature group."""
         rates = {}
 
-        for name, bottleneck in self.bottlenecks.items():
-            start_idx, end_idx = self.group_latent_dims[name]
+        for name, (start_idx, end_idx) in self.group_latent_dims.items():
             group_latent_dim = end_idx - start_idx
-            rates[name] = group_latent_dim / bottleneck.effective_dim
+            rates[name] = group_latent_dim / self.shared_compressor.mu_network.out_features
 
         # Also compute overall rate - weighted average based on feature counts
         total_input_features = sum(
@@ -331,14 +355,13 @@ class FeatureGroupedVAE(nn.Module, BaseModelIO):
         for name in self.feature_groups:
             start_idx, end_idx, compression = self.feature_groups[name]
             latent_start, latent_end = self.group_latent_dims[name]
-            bottleneck = self.bottlenecks[name]
 
             analysis[name] = {
                 "feature_range": (start_idx, end_idx),
                 "feature_count": end_idx - start_idx,
                 "latent_range": (latent_start, latent_end),
                 "latent_dim": latent_end - latent_start,
-                "effective_dim": bottleneck.effective_dim,
+                "effective_dim": self.shared_compressor.mu_network.out_features,
                 "compression": compression,
                 "base_compression": self.base_compression_level,
                 "overall_compression": compression * self.base_compression_level,
