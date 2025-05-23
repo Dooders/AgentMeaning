@@ -1,5 +1,5 @@
 # **Transformational Equivalence: Learning to Preserve Meaning Across Representational Layers**
-
+![Status](https://img.shields.io/badge/status-In%20Development%20–%20Experimental%20%26%20Aspirational-blue)
 ## **Research Objective**
 
 > To explore and implement a learnable system that can transform an agent state through various representational forms—structured, binary, latent, compressed—and reconstruct it while preserving its **semantic meaning**, not just its raw structure.
